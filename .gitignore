@@ -1,0 +1,19 @@
+# Node modules
+node_modules/
+
+# Environment variables (Sensitive Keys!)
+.env
+.env.*
+!.env.example
+
+# Database files
+database.json
+database.json.backup
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
