@@ -25,8 +25,12 @@ app.use(cors());
 app.use(express.json());
 
 // Health check
+app.get('/', (req, res) => {
+  res.send('Task Shredder API is running!');
+});
+
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'FocusFlow Bot', ts: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'Task Shredder API', ts: new Date().toISOString() });
 });
 
 // ─────────────────────────────────────────────
