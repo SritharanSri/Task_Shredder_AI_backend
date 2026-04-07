@@ -10,15 +10,29 @@ const DB_FILE = isVercel
   : path.join(process.cwd(), 'database.json');
 
 
+// Memory fallback for serverless crashes
+let memoryDB = { users: {}, history: [] };
+
 async function getDB() {
-  if (!existsSync(DB_FILE)) {
-    await fs.writeFile(DB_FILE, JSON.stringify({ users: {}, history: [] }));
+  try {
+    if (!existsSync(DB_FILE)) {
+      await fs.writeFile(DB_FILE, JSON.stringify(memoryDB));
+    }
+    const content = await fs.readFile(DB_FILE, 'utf-8');
+    return JSON.parse(content);
+  } catch (err) {
+    console.error("Database read error:", err.message);
+    return memoryDB;
   }
-  return JSON.parse(await fs.readFile(DB_FILE, 'utf-8'));
 }
 
 async function saveDB(data) {
-  await fs.writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  memoryDB = data; // Always save to memory just in case
+  try {
+    await fs.writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error("Database write error:", err.message);
+  }
 }
 
 // ── Helpers ──────────────────────────────
