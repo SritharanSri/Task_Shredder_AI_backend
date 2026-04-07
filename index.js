@@ -11,10 +11,10 @@ const BOT_TOKEN  = process.env.BOT_TOKEN;
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://your-app.vercel.app';
 const PORT       = parseInt(process.env.PORT || '3000', 10);
 const WEBHOOK_URL = process.env.WEBHOOK_URL; // undefined → polling mode
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-if (!GEMINI_API_KEY) {
-  console.warn('⚠️ GEMINI_API_KEY is missing. /api/breakdown will fail.');
+if (!GROQ_API_KEY) {
+  console.warn('⚠️  GROQ_API_KEY is missing. /api/breakdown will fail.');
 }
 
 // ─────────────────────────────────────────────
@@ -144,32 +144,28 @@ if (bot) {
 app.post('/api/breakdown', async (req, res) => {
   const { task } = req.body;
   if (!task) return res.status(400).json({ error: 'Task is required' });
-  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Gemini API not configured' });
+  if (!GROQ_API_KEY) return res.status(500).json({ error: 'Groq API not configured' });
 
-  const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-  
-  const PROMPT_TEMPLATE = `
-Break the following task into exactly 5 clear, actionable Pomodoro-sized steps.
-Each step should take approximately 25 minutes to complete.
-Be specific and practical. Start each step with a strong action verb.
+  const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-Task: "${task}"
-
-Return ONLY a valid JSON array of 5 strings, no explanation, no markdown, no code fences.
-Example format: ["Step 1 description", "Step 2 description", "Step 3 description", "Step 4 description", "Step 5 description"]
-`.trim();
+  const SYSTEM_PROMPT = `You are a productivity assistant. When given a task, break it into exactly 5 clear, actionable Pomodoro-sized steps. Each step should take approximately 25 minutes. Be specific and practical. Start each step with a strong action verb. Return ONLY a valid JSON array of exactly 5 strings, no explanation, no markdown. Example: ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"]`;
 
   try {
-    const response = await fetch(API_URL, {
+    const response = await fetch(GROQ_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: PROMPT_TEMPLATE }] }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 512,
-          responseMimeType: 'application/json',
-        },
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: `Break this task into 5 Pomodoro steps: "${task}"` },
+        ],
+        temperature: 0.7,
+        max_tokens: 512,
+        response_format: { type: 'json_object' },
       }),
     });
 
@@ -179,23 +175,24 @@ Example format: ["Step 1 description", "Step 2 description", "Step 3 description
     }
 
     const data = await response.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) throw new Error('Empty response from Gemini');
+    const raw = data?.choices?.[0]?.message?.content;
+    if (!raw) throw new Error('Empty response from Groq');
 
     let steps;
     try {
-      steps = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      // Groq with json_object may return { steps: [...] } or just an array
+      steps = Array.isArray(parsed) ? parsed : (parsed.steps || parsed.tasks || Object.values(parsed)[0]);
     } catch {
       const match = raw.match(/\[[\s\S]*\]/);
       if (match) steps = JSON.parse(match[0]);
-      else throw new Error('Could not parse AI response');
+      else throw new Error('Could not parse Groq response');
     }
 
     if (!Array.isArray(steps) || steps.length === 0) {
-      throw new Error('Invalid response format from Gemini');
+      throw new Error('Invalid response format from Groq');
     }
 
-    // Assign IDs locally in the backend for convenience
     const formattedSteps = steps.slice(0, 5).map((title, i) => ({
       id: Date.now() + i,
       title: String(title).trim(),
@@ -204,7 +201,7 @@ Example format: ["Step 1 description", "Step 2 description", "Step 3 description
 
     res.json(formattedSteps);
   } catch (err) {
-    console.error('Gemini breakdown error:', err.message);
+    console.error('Groq breakdown error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
