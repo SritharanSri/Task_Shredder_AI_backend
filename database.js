@@ -2,7 +2,13 @@ import fs from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
 
-const DB_FILE = path.join(process.cwd(), 'database.json');
+import os from 'os';
+
+const isVercel = process.env.VERCEL === '1';
+const DB_FILE = isVercel 
+  ? path.join(os.tmpdir(), 'database.json') 
+  : path.join(process.cwd(), 'database.json');
+
 
 async function getDB() {
   if (!existsSync(DB_FILE)) {
