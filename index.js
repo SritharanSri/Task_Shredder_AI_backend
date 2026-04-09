@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
 import { getUser, addSession, updateCredits, clearHistory } from './database.js';
 
@@ -23,6 +24,21 @@ if (!GROQ_API_KEY) {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Rate Limiting: 100 requests per 15 mins for general, 5 per min for AI
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: 'Too many requests, please try again later.' }
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 5,
+  message: { error: 'AI is over capacity. Please wait 60s before shredding another task.' }
+});
+
+app.use('/api/', generalLimiter);
 
 // Health check
 app.get('/', (req, res) => {
@@ -141,7 +157,7 @@ if (bot) {
 // API Endpoints for Frontend
 // ─────────────────────────────────────────────
 
-app.post('/api/breakdown', async (req, res) => {
+app.post('/api/break-task', aiLimiter, async (req, res) => {
   const { task } = req.body;
   if (!task) return res.status(400).json({ error: 'Task is required' });
   if (!GROQ_API_KEY) return res.status(500).json({ error: 'Groq API not configured' });
@@ -151,8 +167,12 @@ app.post('/api/breakdown', async (req, res) => {
   const SYSTEM_PROMPT = `You are a productivity assistant. When given a task, break it into exactly 5 clear, actionable Pomodoro-sized steps. Each step should take approximately 25 minutes. Be specific and practical. Start each step with a strong action verb. Return ONLY a valid JSON array of exactly 5 strings, no explanation, no markdown. Example: ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"]`;
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
     const response = await fetch(GROQ_URL, {
       method: 'POST',
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${GROQ_API_KEY}`,
@@ -168,6 +188,8 @@ app.post('/api/breakdown', async (req, res) => {
         response_format: { type: 'json_object' },
       }),
     });
+    
+    clearTimeout(timeout);
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
