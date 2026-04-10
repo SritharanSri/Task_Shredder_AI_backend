@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
 import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setPremium, restoreStreak, FREE_DAILY_LIMIT } from './database.js';
@@ -42,6 +43,7 @@ app.use(cors({
   },
   credentials: true,
 }));
+app.use(compression()); // gzip all JSON responses
 app.use(express.json({ limit: '16kb' }));
 
 // ── Telegram initData verification (HMAC-SHA256) ────────
@@ -328,6 +330,141 @@ Exactly 5 items.`;
   } catch (err) {
     console.error('Groq breakdown error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Streaming task breakdown (SSE) ────────────
+// Each step is emitted as `data: {JSON}\n\n` the moment it is parsed.
+// The client renders steps live — no waiting for the full response.
+app.post('/api/break-task-stream', aiLimiter, async (req, res) => {
+  const rawTask = req.body?.task;
+  const userId  = req.body?.userId;
+  if (!rawTask) return res.status(400).json({ error: 'Task is required' });
+  if (!GROQ_API_KEY) return res.status(500).json({ error: 'Groq API not configured' });
+
+  const task = String(rawTask).replace(/['"]/g, '').replace(/\n+/g, ' ').trim().slice(0, 280);
+  if (!task) return res.status(400).json({ error: 'Task text is invalid' });
+
+  if (userId) {
+    const check = await checkAndIncrementBreakdown(String(userId)).catch(() => null);
+    if (check && !check.allowed) {
+      return res.status(429).json({
+        error: 'DAILY_LIMIT_REACHED',
+        message: `Free users get ${FREE_DAILY_LIMIT} AI breakdowns per day. Upgrade to Premium for unlimited access! ⭐`,
+        upgradeRequired: true,
+      });
+    }
+  }
+
+  // SSE headers — compression is skipped for SSE (streaming body)
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable Nginx buffering on Vercel
+  res.flushHeaders();
+
+  const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+  // Each step is requested as its own JSON object on a separate line for easy stream parsing.
+  const STREAM_PROMPT = `You are a world-class productivity coach. Break the task into exactly 5 prioritised micro-steps.
+Output ONLY 5 lines. Each line must be a self-contained JSON object — no array wrapper, no markdown, no extra text:
+{"title":"<1 emoji + strong action verb + hyper-specific action>","time":"<e.g. 15 min>","difficulty":"<Easy 🟢 OR Medium 🟡 OR Hard 🔴>","motivation":"<max 10 words, punchy and personal>"}
+Newline between each JSON object. No other text.`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const groqRes = await fetch(GROQ_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: STREAM_PROMPT },
+          { role: 'user', content: `Task: ${task}` },
+        ],
+        temperature: 0.7,
+        max_tokens: 600,
+        stream: true,
+      }),
+    });
+
+    clearTimeout(timeout);
+
+    if (!groqRes.ok) {
+      const errBody = await groqRes.json().catch(() => ({}));
+      res.write(`data: ${JSON.stringify({ error: errBody?.error?.message || `HTTP ${groqRes.status}` })}\n\n`);
+      return res.end();
+    }
+
+    const reader = groqRes.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';    // accumulates raw Groq SSE chunks
+    let lineBuf = ''; // accumulates model output tokens
+    let stepCount = 0;
+
+    const tryEmitLine = (line) => {
+      const t = line.trim();
+      if (!t.startsWith('{')) return;
+      try {
+        const step = JSON.parse(t);
+        if (!step.title) return;
+        stepCount++;
+        res.write(`data: ${JSON.stringify({
+          id: Date.now() + stepCount,
+          title: String(step.title).trim(),
+          time:  step.time       || '25 min',
+          difficulty: step.difficulty || 'Medium 🟡',
+          motivation: step.motivation || '',
+          completed: false,
+        })}\n\n`);
+      } catch { /* incomplete JSON, ignore */ }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+
+      // Each Groq SSE line is `data: {...}\n`; split and process
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        if (!rawLine.startsWith('data: ')) continue;
+        const payload = rawLine.slice(6).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const chunk = JSON.parse(payload);
+          const token = chunk.choices?.[0]?.delta?.content ?? '';
+          lineBuf += token;
+
+          // Emit each newline-terminated JSON line as soon as it's complete
+          const nlIdx = lineBuf.lastIndexOf('\n');
+          if (nlIdx !== -1) {
+            const done = lineBuf.slice(0, nlIdx);
+            lineBuf = lineBuf.slice(nlIdx + 1);
+            for (const ln of done.split('\n')) tryEmitLine(ln);
+          }
+        } catch { /* non-JSON chunk */ }
+      }
+    }
+
+    // Flush remaining buffer
+    for (const ln of lineBuf.split('\n')) tryEmitLine(ln);
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error('[Stream] Error:', err.message);
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
