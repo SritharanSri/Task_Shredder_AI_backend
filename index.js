@@ -24,9 +24,11 @@ if (!GROQ_API_KEY) {
 // ─────────────────────────────────────────────
 const app = express();
 
-// Restrict CORS to known origins — prevents credential harvesting from external sites
+// Restrict CORS to known origins.
+// Set ALLOWED_ORIGINS in Vercel env as a comma-separated list of extra origins.
 const ALLOWED_ORIGINS = [
   WEBAPP_URL,
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:5175',
@@ -34,8 +36,10 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no Origin header (Telegram WebView, mobile, curl in dev)
-    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
+    // No Origin header = Telegram WebView, curl, mobile — allow through
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o))) return cb(null, true);
+    console.warn(`[CORS] Blocked origin: ${origin}. Allowed: ${ALLOWED_ORIGINS.join(', ')}`);
     cb(new Error('Not allowed by CORS'));
   },
   credentials: true,
