@@ -5,7 +5,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
-import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setPremium, restoreStreak, FREE_DAILY_LIMIT } from './database.js';
+import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setPremium, restoreStreak, recordPayment, FREE_DAILY_LIMIT } from './database.js';
 
 // ─────────────────────────────────────────────
 // Config & Validation
@@ -15,6 +15,10 @@ const WEBAPP_URL = process.env.WEBAPP_URL || 'https://your-app.vercel.app';
 const PORT       = parseInt(process.env.PORT || '3000', 10);
 const WEBHOOK_URL = process.env.WEBHOOK_URL; // undefined → polling mode
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET
+  || crypto.createHash('sha256').update(String(BOT_TOKEN || 'bot')).digest('hex').slice(0, 32);
+const PAYMENT_PAYLOAD_SECRET = process.env.PAYMENT_PAYLOAD_SECRET
+  || crypto.createHash('sha256').update(String(BOT_TOKEN || 'pay')).digest('hex');
 
 if (!GROQ_API_KEY) {
   console.warn('⚠️  GROQ_API_KEY is missing. /api/breakdown will fail.');
@@ -73,6 +77,26 @@ function withTelegramAuth(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized: invalid Telegram session' });
   }
   next();
+}
+
+function createSignedPayload({ product, userId, plan }) {
+  const ts = Date.now().toString(36);
+  const nonce = crypto.randomBytes(4).toString('hex');
+  const raw = `v1|${product}|${userId}|${plan}|${ts}|${nonce}`;
+  const sig = crypto.createHmac('sha256', PAYMENT_PAYLOAD_SECRET).update(raw).digest('hex').slice(0, 12);
+  return `${raw}|${sig}`;
+}
+
+function parseAndVerifyPayload(payload) {
+  const parts = String(payload || '').split('|');
+  if (parts.length !== 7 || parts[0] !== 'v1') return null;
+
+  const [version, product, userId, plan, ts, nonce, sig] = parts;
+  const raw = `${version}|${product}|${userId}|${plan}|${ts}|${nonce}`;
+  const expected = crypto.createHmac('sha256', PAYMENT_PAYLOAD_SECRET).update(raw).digest('hex').slice(0, 12);
+  if (sig !== expected) return null;
+
+  return { product, userId, plan, ts, nonce };
 }
 
 // Rate Limiting: 100 requests per 15 mins for general, 5 per min for AI
@@ -519,19 +543,29 @@ app.post('/api/user/:userId/streak-restore', withTelegramAuth, async (req, res) 
   }
 });
 
-app.post('/api/invoice', async (req, res) => {
+app.post('/api/invoice', withTelegramAuth, async (req, res) => {
   if (!bot) return res.status(500).json({ error: 'Bot is offline' });
-  const { userId, type = 'credits' } = req.body;
+  const { userId, type = 'premium_plan' } = req.body;
   if (!userId) return res.status(400).json({ error: 'User ID is required' });
 
   try {
     let invoiceOptions;
 
-    if (type === 'premium_monthly') {
+    if (type === 'premium_plan') {
+      // Required plan from product spec
+      invoiceOptions = {
+        title: 'Premium Access',
+        description: 'Unlock advanced AI features',
+        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_monthly' }),
+        provider_token: '',
+        currency: 'XTR',
+        prices: [{ label: 'Premium Plan', amount: 100 }],
+      };
+    } else if (type === 'premium_monthly') {
       invoiceOptions = {
         title: '⭐ Task Shredder AI Premium — Monthly',
         description: 'Unlimited AI breakdowns, custom timer, full history, streak restore & more.',
-        payload: `premium_1m_${userId}_${Date.now()}`,
+        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_monthly' }),
         provider_token: '',
         currency: 'XTR',
         prices: [{ label: 'Premium Monthly', amount: 299 }],
@@ -540,7 +574,7 @@ app.post('/api/invoice', async (req, res) => {
       invoiceOptions = {
         title: '⭐ Task Shredder AI Premium — Annual',
         description: 'Everything in Premium for 12 months. Save 44% vs monthly.',
-        payload: `premium_12m_${userId}_${Date.now()}`,
+        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_annual' }),
         provider_token: '',
         currency: 'XTR',
         prices: [{ label: 'Premium Annual', amount: 1999 }],
@@ -549,17 +583,16 @@ app.post('/api/invoice', async (req, res) => {
       invoiceOptions = {
         title: '⭐ Task Shredder AI Premium — Lifetime',
         description: 'One-time purchase. All Premium features forever.',
-        payload: `premium_life_${userId}_${Date.now()}`,
+        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_lifetime' }),
         provider_token: '',
         currency: 'XTR',
         prices: [{ label: 'Premium Lifetime', amount: 2499 }],
       };
     } else {
-      // Default: credits pack
       invoiceOptions = {
         title: '20 AI Credits',
         description: 'Get 20 AI credits to break down tasks in Task Shredder AI.',
-        payload: `credits_${userId}_${Date.now()}`,
+        payload: createSignedPayload({ product: 'credits_pack', userId, plan: 'credits_20' }),
         provider_token: '',
         currency: 'XTR',
         prices: [{ label: '20 Credits', amount: 50 }],
@@ -567,7 +600,7 @@ app.post('/api/invoice', async (req, res) => {
     }
 
     const invoiceLink = await bot.telegram.createInvoiceLink(invoiceOptions);
-    res.json({ invoiceLink });
+    res.json({ invoiceLink, type, currency: 'XTR' });
   } catch (err) {
     console.error('Invoice generation failed:', err);
     res.status(500).json({ error: 'Failed to generate invoice link' });
@@ -581,27 +614,47 @@ if (bot) {
   });
 
   bot.on('successful_payment', async (ctx) => {
-    console.log('✅ Payment successful:', ctx.message.successful_payment);
     const payment = ctx.message.successful_payment;
-    const payload = payment.invoice_payload;
-    const parts = payload.split('_');
+    const parsed = parseAndVerifyPayload(payment?.invoice_payload);
+    if (!parsed) {
+      console.error('❌ Invalid payment payload signature:', payment?.invoice_payload);
+      return;
+    }
+
+    const { product, userId, plan } = parsed;
+    const chargeId = payment.telegram_payment_charge_id;
 
     try {
-      if (payload.startsWith('premium_1m_')) {
-        const userId = parts[2];
-        await setPremium(userId, 1);
-        await ctx.reply('🎉 Welcome to Premium! You now have unlimited breakdowns, custom timer, full history and more. ⭐');
-      } else if (payload.startsWith('premium_12m_')) {
-        const userId = parts[2];
-        await setPremium(userId, 12);
-        await ctx.reply('🎉 Welcome to Annual Premium! Access unlocked for 12 months. ⭐');
-      } else if (payload.startsWith('premium_life_')) {
-        const userId = parts[2];
-        await setPremium(userId, -1); // lifetime
-        await ctx.reply('🎉 Welcome to Lifetime Premium! All features unlocked forever. ⭐👑');
-      } else if (payload.startsWith('credits_')) {
-        const userId = parts[1];
-        if (userId) await updateCredits(userId, 20);
+      const recorded = await recordPayment({
+        telegram_payment_charge_id: chargeId,
+        provider_payment_charge_id: payment.provider_payment_charge_id || null,
+        user_id: userId,
+        payload: payment.invoice_payload,
+        product,
+        plan,
+        amount: payment.total_amount,
+        currency: payment.currency,
+      });
+
+      if (!recorded.inserted) {
+        console.log(`ℹ️ Duplicate payment ignored: ${chargeId}`);
+        return;
+      }
+
+      if (product === 'premium_plan') {
+        if (plan === 'premium_lifetime') {
+          await setPremium(userId, -1);
+          await ctx.reply('🎉 Lifetime Pro unlocked! All premium features are now active. ⭐👑');
+        } else if (plan === 'premium_annual') {
+          await setPremium(userId, 12);
+          await ctx.reply('🎉 Annual Pro unlocked! You now have full premium access. ⭐');
+        } else {
+          await setPremium(userId, 1);
+          await ctx.reply('🎉 Pro unlocked! Advanced AI features are now active. ⭐');
+        }
+      } else if (product === 'credits_pack') {
+        await updateCredits(userId, 20);
+        await ctx.reply('✅ Payment received. +20 AI credits have been added. ⚡');
       }
     } catch (err) {
       console.error('Failed processing payment:', err);
@@ -624,8 +677,18 @@ async function launch() {
   if (WEBHOOK_URL) {
     // ── Production: webhook mode ──────────────
     const webhookPath = `/webhook/${BOT_TOKEN.slice(-10)}`;
-    app.use(bot.webhookCallback(webhookPath));
-    await bot.telegram.setWebhook(`${WEBHOOK_URL}${webhookPath}`);
+    app.post(webhookPath, (req, res, next) => {
+      const incoming = req.headers['x-telegram-bot-api-secret-token'];
+      if (incoming !== TELEGRAM_WEBHOOK_SECRET) {
+        return res.status(401).json({ error: 'Invalid Telegram webhook secret' });
+      }
+      return bot.webhookCallback(webhookPath)(req, res, next);
+    });
+
+    await bot.telegram.setWebhook(`${WEBHOOK_URL}${webhookPath}`, {
+      secret_token: TELEGRAM_WEBHOOK_SECRET,
+      allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+    });
     console.log(`🔗 Webhook set to ${WEBHOOK_URL}${webhookPath}`);
 
     app.listen(PORT, () => {

@@ -37,6 +37,7 @@ function isPremiumActive(user) {
 function defaultUserResponse(id) {
   return {
     id,
+    telegramId: id,
     credits: 10,
     streak: 0,
     lastStreak: 0,
@@ -45,6 +46,7 @@ function defaultUserResponse(id) {
     totalCompleted: 0,
     isPremium: false,
     premiumExpiry: null,
+    plan: 'free',
     dailyBreakdowns: 0,
     dailyBreakdownDate: getTodayStr(),
     history: [],
@@ -65,7 +67,7 @@ async function getOrCreateUser(id) {
   if (error && error.code === 'PGRST116') {
     const { data: newUser, error: insertErr } = await supabase
       .from('users')
-      .insert({ id })
+      .insert({ id, telegram_id: id, plan: 'free' })
       .select()
       .single();
     if (insertErr) throw insertErr;
@@ -127,6 +129,7 @@ export async function getUser(id) {
 
     return {
       id,
+      telegramId: user.telegram_id || id,
       credits: user.credits,
       streak: user.streak,
       lastStreak: user.last_streak,
@@ -135,6 +138,7 @@ export async function getUser(id) {
       totalCompleted: user.total_completed,
       isPremium: premium,
       premiumExpiry: user.premium_expiry,
+      plan: user.plan || 'free',
       dailyBreakdowns: user.daily_breakdowns,
       dailyBreakdownDate: user.daily_breakdown_date,
       history: (history || []).map(h => ({ title: h.title, completedAt: h.completed_at })),
@@ -248,6 +252,10 @@ export async function setPremium(id, months) {
   const user = await getOrCreateUser(id);
   const updates = { is_premium: true };
 
+  if (months === -1) updates.plan = 'premium_lifetime';
+  else if (months === 12) updates.plan = 'premium_annual';
+  else updates.plan = 'premium_monthly';
+
   if (months === -1) {
     updates.premium_expiry = null;
   } else {
@@ -264,6 +272,20 @@ export async function setPremium(id, months) {
   if (error) throw error;
 
   return getUser(id);
+}
+
+// Idempotent payment recorder.
+// Returns { inserted: true } on first processing, { inserted: false } on duplicate.
+export async function recordPayment(payment) {
+  if (!supabase) return { inserted: true };
+
+  const { error } = await supabase
+    .from('payments')
+    .insert(payment);
+
+  if (!error) return { inserted: true };
+  if (error.code === '23505') return { inserted: false }; // unique violation
+  throw error;
 }
 
 export async function restoreStreak(id) {  if (!supabase) throw new Error('Database not configured');
