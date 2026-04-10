@@ -11,7 +11,7 @@ if (!SUPABASE_READY) {
 }
 
 // ── Free tier constants ───────────────────────────────────
-export const FREE_DAILY_LIMIT = 3;
+export const FREE_DAILY_LIMIT = 5;
 export const FREE_MAX_CREDITS = 30;
 export const PREMIUM_MAX_CREDITS = 500;
 
@@ -33,6 +33,18 @@ function isPremiumActive(user) {
   return new Date(user.premium_expiry) > new Date();
 }
 
+function normalizePlan(user) {
+  const active = isPremiumActive(user);
+  if (!active) return 'free';
+
+  const raw = String(user.plan || '').toLowerCase();
+  if (raw === 'starter' || raw === 'pro' || raw === 'free') return raw;
+
+  // Backward compatibility with legacy premium plan names
+  if (raw.includes('lifetime') || raw.includes('annual') || raw.includes('pro')) return 'pro';
+  return 'starter';
+}
+
 // Default user shape returned when DB is unavailable
 function defaultUserResponse(id) {
   return {
@@ -45,9 +57,11 @@ function defaultUserResponse(id) {
     lastActiveDay: null,
     totalCompleted: 0,
     isPremium: false,
+    isPro: false,
     premiumExpiry: null,
     plan: 'free',
     dailyBreakdowns: 0,
+    taskCountToday: 0,
     dailyBreakdownDate: getTodayStr(),
     history: [],
     dailyBreakdownsLeft: FREE_DAILY_LIMIT,
@@ -102,6 +116,7 @@ export async function getUser(id) {
     }
     if (user.daily_breakdown_date !== today) {
       updates.daily_breakdowns = 0;
+      updates.task_count_today = 0;
       updates.daily_breakdown_date = today;
     }
 
@@ -122,7 +137,8 @@ export async function getUser(id) {
       .order('completed_at', { ascending: false })
       .limit(50);
 
-    const premium = isPremiumActive(user);
+    const plan = normalizePlan(user);
+    const premium = plan !== 'free';
     const dailyBreakdownsLeft = premium
       ? -1
       : Math.max(0, FREE_DAILY_LIMIT - (user.daily_breakdowns || 0));
@@ -137,11 +153,15 @@ export async function getUser(id) {
       lastActiveDay: user.last_active_day,
       totalCompleted: user.total_completed,
       isPremium: premium,
+      isPro: plan === 'pro',
       premiumExpiry: user.premium_expiry,
-      plan: user.plan || 'free',
+      plan,
       dailyBreakdowns: user.daily_breakdowns,
+      taskCountToday: user.task_count_today ?? user.daily_breakdowns,
       dailyBreakdownDate: user.daily_breakdown_date,
-      history: (history || []).map(h => ({ title: h.title, completedAt: h.completed_at })),
+      history: plan === 'free'
+        ? []
+        : (history || []).map(h => ({ title: h.title, completedAt: h.completed_at })),
       dailyBreakdownsLeft,
       freeLimit: FREE_DAILY_LIMIT,
     };
@@ -175,10 +195,19 @@ export async function addSession(id, taskTitle) {
       updates.today_sessions = 1;
     }
 
-    const [{ error: updateErr }, { error: insertErr }] = await Promise.all([
+    const plan = normalizePlan(user);
+    const writes = [
       supabase.from('users').update(updates).eq('id', id),
-      supabase.from('sessions').insert({ user_id: id, title: taskTitle }),
-    ]);
+    ];
+
+    // Free plan has no history saving by design.
+    if (plan !== 'free') {
+      writes.push(supabase.from('sessions').insert({ user_id: id, title: taskTitle }));
+    }
+
+    const [userWrite, historyWrite] = await Promise.all(writes);
+    const updateErr = userWrite?.error;
+    const insertErr = historyWrite?.error;
 
     if (updateErr) throw updateErr;
     if (insertErr) throw insertErr;
@@ -195,7 +224,7 @@ export async function updateCredits(id, amount) {
 
   try {
     const user = await getOrCreateUser(id);
-    const maxCredits = isPremiumActive(user) ? PREMIUM_MAX_CREDITS : FREE_MAX_CREDITS;
+    const maxCredits = normalizePlan(user) === 'free' ? FREE_MAX_CREDITS : PREMIUM_MAX_CREDITS;
     const newCredits = Math.max(0, Math.min((user.credits || 0) + amount, maxCredits));
     const { error } = await supabase.from('users').update({ credits: newCredits }).eq('id', id);
     if (error) throw error;
@@ -220,12 +249,13 @@ export async function clearHistory(id) {
 }
 
 export async function checkAndIncrementBreakdown(id) {
-  if (!supabase) return { allowed: true, dailyBreakdowns: 0, isPremium: false };
+  if (!supabase) return { allowed: true, dailyBreakdowns: 0, isPremium: false, plan: 'free' };
 
   try {
     const user = await getOrCreateUser(id);
     const today = getTodayStr();
-    const premium = isPremiumActive(user);
+    const plan = normalizePlan(user);
+    const premium = plan !== 'free';
 
     let daily = user.daily_breakdown_date !== today ? 0 : (user.daily_breakdowns || 0);
 
@@ -235,43 +265,40 @@ export async function checkAndIncrementBreakdown(id) {
 
     const { error } = await supabase
       .from('users')
-      .update({ daily_breakdowns: daily + 1, daily_breakdown_date: today })
+      .update({ daily_breakdowns: daily + 1, task_count_today: daily + 1, daily_breakdown_date: today })
       .eq('id', id);
     if (error) throw error;
 
-    return { allowed: true, dailyBreakdowns: daily + 1, isPremium: premium };
+    return { allowed: true, dailyBreakdowns: daily + 1, isPremium: premium, plan };
   } catch (err) {
     console.error(`[DB] checkAndIncrementBreakdown(${id}) failed:`, err.message);
-    return { allowed: true, dailyBreakdowns: 0, isPremium: false };
+    return { allowed: true, dailyBreakdowns: 0, isPremium: false, plan: 'free' };
   }
 }
 
-export async function setPremium(id, months) {
+export async function setUserPlan(id, plan = 'starter') {
   if (!supabase) throw new Error('Database not configured');
+  const normalized = (plan === 'pro' || plan === 'starter') ? plan : 'starter';
 
-  const user = await getOrCreateUser(id);
-  const updates = { is_premium: true };
+  const updates = {
+    is_premium: true,
+    premium_expiry: null,
+    plan: normalized,
+  };
 
-  if (months === -1) updates.plan = 'premium_lifetime';
-  else if (months === 12) updates.plan = 'premium_annual';
-  else updates.plan = 'premium_monthly';
-
-  if (months === -1) {
-    updates.premium_expiry = null;
-  } else {
-    const base = (user.premium_expiry && new Date(user.premium_expiry) > new Date())
-      ? new Date(user.premium_expiry)
-      : new Date();
-    base.setMonth(base.getMonth() + months);
-    updates.premium_expiry = base.toISOString();
-  }
-
-  if ((user.credits || 0) < 50) updates.credits = 50;
+  // Give paid users a healthy credit buffer for immediate activation.
+  if (normalized === 'pro') updates.credits = 100;
+  else updates.credits = 50;
 
   const { error } = await supabase.from('users').update(updates).eq('id', id);
   if (error) throw error;
-
   return getUser(id);
+}
+
+export async function setPremium(id, months) {
+  // Backward compatibility wrapper.
+  const plan = months === -1 || months === 12 ? 'pro' : 'starter';
+  return setUserPlan(id, plan);
 }
 
 // Idempotent payment recorder.
@@ -290,7 +317,7 @@ export async function recordPayment(payment) {
 
 export async function restoreStreak(id) {  if (!supabase) throw new Error('Database not configured');
   const user = await getOrCreateUser(id);
-  if (!isPremiumActive(user)) throw new Error('Streak restore requires Premium \u2b50');
+  if (normalizePlan(user) !== 'pro') throw new Error('Streak restore requires Pro \u2b50');
 
   const { error } = await supabase
     .from('users')

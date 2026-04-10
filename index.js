@@ -5,7 +5,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
-import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setPremium, restoreStreak, recordPayment, FREE_DAILY_LIMIT } from './database.js';
+import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setUserPlan, restoreStreak, recordPayment, FREE_DAILY_LIMIT } from './database.js';
 
 // ─────────────────────────────────────────────
 // Config & Validation
@@ -77,6 +77,19 @@ function withTelegramAuth(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized: invalid Telegram session' });
   }
   next();
+}
+
+function extractTelegramUserId(initData) {
+  try {
+    if (!initData) return null;
+    const params = new URLSearchParams(initData);
+    const userRaw = params.get('user');
+    if (!userRaw) return null;
+    const parsed = JSON.parse(userRaw);
+    return parsed?.id ? String(parsed.id) : null;
+  } catch {
+    return null;
+  }
 }
 
 function createSignedPayload({ product, userId, plan }) {
@@ -261,6 +274,7 @@ if (bot) {
 app.post('/api/break-task', aiLimiter, async (req, res) => {
   const rawTask = req.body?.task;
   const userId  = req.body?.userId;
+  const mode = String(req.body?.mode || 'focus').toLowerCase();
   if (!rawTask) return res.status(400).json({ error: 'Task is required' });
   if (!GROQ_API_KEY) return res.status(500).json({ error: 'Groq API not configured' });
 
@@ -269,29 +283,33 @@ app.post('/api/break-task', aiLimiter, async (req, res) => {
   if (!task) return res.status(400).json({ error: 'Task text is invalid' });
 
   // ── Free-tier daily limit (server-side enforcement) ──
+  let userPlan = 'free';
   if (userId) {
     const check = await checkAndIncrementBreakdown(String(userId)).catch(() => null);
+    userPlan = check?.plan || (await getUser(String(userId)).then(u => u?.plan).catch(() => 'free'));
     if (check && !check.allowed) {
       return res.status(429).json({
         error: 'DAILY_LIMIT_REACHED',
-        message: `Free users get ${FREE_DAILY_LIMIT} AI breakdowns per day. Upgrade to Premium for unlimited access! ⭐`,
+        message: `Free users get ${FREE_DAILY_LIMIT} AI breakdowns per day. You're becoming productive 🔥 Unlock unlimited mode?`,
         upgradeRequired: true,
       });
     }
   }
 
   const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-  const SYSTEM_PROMPT = `You are a world-class productivity coach and behavioral psychologist. Break the given task into exactly 5 micro-actionable steps ordered by priority (most critical first).
+  const isPro = userPlan === 'pro';
+  const isStarter = userPlan === 'starter';
 
-For EACH step provide:
-- "title": Lead with 1 relevant emoji then a strong action verb. Be hyper-specific to this exact task — zero generic advice. Make it feel tailor-made.
-- "time": Realistic time estimate as a short string, e.g. "10 min", "25 min", "1 hr". Vary it — not every step is 25 min.
-- "difficulty": Exactly one of: "Easy 🟢", "Medium 🟡", or "Hard 🔴"
-- "motivation": One punchy, task-specific motivational tip. Max 12 words. Make it feel personal and energising.
-
-Return ONLY valid JSON in this exact shape — no explanation, no markdown:
-{ "steps": [ { "title": "...", "time": "...", "difficulty": "...", "motivation": "..." }, ... ] }
-Exactly 5 items.`;
+  const SYSTEM_PROMPT = isPro
+    ? `You are an elite productivity coach. Build exactly 5 micro-actionable steps for the task.
+Use mode="${mode}" where focus=high-discipline, deep=long concentration blocks, lazy=low-friction momentum.
+For EACH step provide: title, time, difficulty, motivation.
+Return JSON only: {"steps":[{"title":"...","time":"...","difficulty":"Easy 🟢|Medium 🟡|Hard 🔴","motivation":"..."}]}`
+    : isStarter
+      ? `Break the task into exactly 5 practical action steps for fast execution.
+Keep output concise and clear. Return JSON only: {"steps":[{"title":"...","time":"...","difficulty":"Easy 🟢|Medium 🟡|Hard 🔴","motivation":"..."}]}`
+      : `Break the task into exactly 5 basic actionable steps for a beginner.
+Keep each step short, clear, and simple. Return JSON only: {"steps":["Step 1","Step 2","Step 3","Step 4","Step 5"]}`;
 
   try {
     const controller = new AbortController();
@@ -310,8 +328,8 @@ Exactly 5 items.`;
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: `Break this task into 5 prioritised micro-steps: ${task}` },
         ],
-        temperature: 0.7,
-        max_tokens: 512,
+        temperature: isPro ? 0.7 : 0.45,
+        max_tokens: isPro ? 520 : isStarter ? 360 : 220,
         response_format: { type: 'json_object' },
       }),
     });
@@ -344,9 +362,9 @@ Exactly 5 items.`;
     const formattedSteps = steps.slice(0, 5).map((step, i) => ({
       id: Date.now() + i,
       title: String(typeof step === 'string' ? step : (step.title || step)).trim(),
-      time: step.time || '25 min',
-      difficulty: step.difficulty || 'Medium 🟡',
-      motivation: step.motivation || '',
+      time: isPro || isStarter ? (step.time || '25 min') : '',
+      difficulty: isPro || isStarter ? (step.difficulty || 'Medium 🟡') : '',
+      motivation: isPro ? (step.motivation || '') : '',
       completed: false,
     }));
 
@@ -363,18 +381,21 @@ Exactly 5 items.`;
 app.post('/api/break-task-stream', aiLimiter, async (req, res) => {
   const rawTask = req.body?.task;
   const userId  = req.body?.userId;
+  const mode = String(req.body?.mode || 'focus').toLowerCase();
   if (!rawTask) return res.status(400).json({ error: 'Task is required' });
   if (!GROQ_API_KEY) return res.status(500).json({ error: 'Groq API not configured' });
 
   const task = String(rawTask).replace(/['"]/g, '').replace(/\n+/g, ' ').trim().slice(0, 280);
   if (!task) return res.status(400).json({ error: 'Task text is invalid' });
 
+  let userPlan = 'free';
   if (userId) {
     const check = await checkAndIncrementBreakdown(String(userId)).catch(() => null);
+    userPlan = check?.plan || (await getUser(String(userId)).then(u => u?.plan).catch(() => 'free'));
     if (check && !check.allowed) {
       return res.status(429).json({
         error: 'DAILY_LIMIT_REACHED',
-        message: `Free users get ${FREE_DAILY_LIMIT} AI breakdowns per day. Upgrade to Premium for unlimited access! ⭐`,
+        message: `Free users get ${FREE_DAILY_LIMIT} AI breakdowns per day. You're becoming productive 🔥 Unlock unlimited mode?`,
         upgradeRequired: true,
       });
     }
@@ -388,11 +409,21 @@ app.post('/api/break-task-stream', aiLimiter, async (req, res) => {
   res.flushHeaders();
 
   const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+  const isPro = userPlan === 'pro';
+  const isStarter = userPlan === 'starter';
   // Each step is requested as its own JSON object on a separate line for easy stream parsing.
-  const STREAM_PROMPT = `You are a world-class productivity coach. Break the task into exactly 5 prioritised micro-steps.
+  const STREAM_PROMPT = isPro
+    ? `You are a world-class productivity coach. Break the task into exactly 5 prioritised micro-steps using mode=${mode}.
 Output ONLY 5 lines. Each line must be a self-contained JSON object — no array wrapper, no markdown, no extra text:
 {"title":"<1 emoji + strong action verb + hyper-specific action>","time":"<e.g. 15 min>","difficulty":"<Easy 🟢 OR Medium 🟡 OR Hard 🔴>","motivation":"<max 10 words, punchy and personal>"}
-Newline between each JSON object. No other text.`;
+Newline between each JSON object. No other text.`
+    : isStarter
+      ? `Break the task into exactly 5 practical fast-execution steps.
+Output ONLY 5 lines. Each line must be a JSON object:
+{"title":"...","time":"...","difficulty":"Easy 🟢 OR Medium 🟡 OR Hard 🔴","motivation":""}`
+      : `Break the task into exactly 5 basic beginner-friendly steps.
+Output ONLY 5 lines. Each line must be a JSON object:
+{"title":"..."}`;
 
   try {
     const controller = new AbortController();
@@ -411,8 +442,8 @@ Newline between each JSON object. No other text.`;
           { role: 'system', content: STREAM_PROMPT },
           { role: 'user', content: `Task: ${task}` },
         ],
-        temperature: 0.7,
-        max_tokens: 600,
+        temperature: isPro ? 0.7 : 0.45,
+        max_tokens: isPro ? 620 : isStarter ? 380 : 220,
         stream: true,
       }),
     });
@@ -441,9 +472,9 @@ Newline between each JSON object. No other text.`;
         res.write(`data: ${JSON.stringify({
           id: Date.now() + stepCount,
           title: String(step.title).trim(),
-          time:  step.time       || '25 min',
-          difficulty: step.difficulty || 'Medium 🟡',
-          motivation: step.motivation || '',
+          time: isPro || isStarter ? (step.time || '25 min') : '',
+          difficulty: isPro || isStarter ? (step.difficulty || 'Medium 🟡') : '',
+          motivation: isPro ? (step.motivation || '') : '',
           completed: false,
         })}\n\n`);
       } catch { /* incomplete JSON, ignore */ }
@@ -539,63 +570,58 @@ app.post('/api/user/:userId/streak-restore', withTelegramAuth, async (req, res) 
     const user = await restoreStreak(req.params.userId);
     res.json(user);
   } catch (err) {
-    res.status(err.message.includes('Premium') ? 403 : 500).json({ error: err.message });
+    res.status(err.message.includes('Pro') ? 403 : 500).json({ error: err.message });
   }
 });
 
 app.post('/api/invoice', withTelegramAuth, async (req, res) => {
   if (!bot) return res.status(500).json({ error: 'Bot is offline' });
-  const { userId, type = 'premium_plan' } = req.body;
+  const { userId, type = 'starter_plan' } = req.body;
   if (!userId) return res.status(400).json({ error: 'User ID is required' });
+
+  const telegramUserId = extractTelegramUserId(req.headers['x-telegram-init-data'] || '');
+  if (telegramUserId && telegramUserId !== String(userId)) {
+    return res.status(403).json({ error: 'User mismatch for invoice creation' });
+  }
 
   try {
     let invoiceOptions;
 
-    if (type === 'premium_plan') {
-      // Required plan from product spec
+    if (type === 'starter_plan') {
       invoiceOptions = {
-        title: 'Premium Access',
-        description: 'Unlock advanced AI features',
-        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_monthly' }),
+        title: 'Starter Access',
+        description: 'Unlimited task generation, history, copy/share, fast mode',
+        payload: createSignedPayload({ product: 'plan_upgrade', userId, plan: 'starter' }),
         provider_token: '',
         currency: 'XTR',
-        prices: [{ label: 'Premium Plan', amount: 100 }],
+        prices: [{ label: 'Starter Plan', amount: 100 }],
       };
-    } else if (type === 'premium_monthly') {
+    } else if (type === 'pro_plan') {
       invoiceOptions = {
-        title: '⭐ Task Shredder AI Premium — Monthly',
-        description: 'Unlimited AI breakdowns, custom timer, full history, streak restore & more.',
-        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_monthly' }),
+        title: 'Pro Access',
+        description: 'Advanced AI breakdown, smart modes, deep productivity tools',
+        payload: createSignedPayload({ product: 'plan_upgrade', userId, plan: 'pro' }),
         provider_token: '',
         currency: 'XTR',
-        prices: [{ label: 'Premium Monthly', amount: 299 }],
+        prices: [{ label: 'Pro Plan', amount: 300 }],
       };
-    } else if (type === 'premium_annual') {
+    } else if (type === 'basic_boost') {
       invoiceOptions = {
-        title: '⭐ Task Shredder AI Premium — Annual',
-        description: 'Everything in Premium for 12 months. Save 44% vs monthly.',
-        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_annual' }),
+        title: 'Basic Boost',
+        description: 'Small Stars support pack with +10 credits',
+        payload: createSignedPayload({ product: 'credits_pack', userId, plan: 'basic_credits' }),
         provider_token: '',
         currency: 'XTR',
-        prices: [{ label: 'Premium Annual', amount: 1999 }],
-      };
-    } else if (type === 'premium_lifetime') {
-      invoiceOptions = {
-        title: '⭐ Task Shredder AI Premium — Lifetime',
-        description: 'One-time purchase. All Premium features forever.',
-        payload: createSignedPayload({ product: 'premium_plan', userId, plan: 'premium_lifetime' }),
-        provider_token: '',
-        currency: 'XTR',
-        prices: [{ label: 'Premium Lifetime', amount: 2499 }],
+        prices: [{ label: 'Basic Boost', amount: 50 }],
       };
     } else {
       invoiceOptions = {
-        title: '20 AI Credits',
-        description: 'Get 20 AI credits to break down tasks in Task Shredder AI.',
-        payload: createSignedPayload({ product: 'credits_pack', userId, plan: 'credits_20' }),
+        title: 'Starter Access',
+        description: 'Unlimited task generation, history, copy/share, fast mode',
+        payload: createSignedPayload({ product: 'plan_upgrade', userId, plan: 'starter' }),
         provider_token: '',
         currency: 'XTR',
-        prices: [{ label: '20 Credits', amount: 50 }],
+        prices: [{ label: 'Starter Plan', amount: 100 }],
       };
     }
 
@@ -641,20 +667,17 @@ if (bot) {
         return;
       }
 
-      if (product === 'premium_plan') {
-        if (plan === 'premium_lifetime') {
-          await setPremium(userId, -1);
-          await ctx.reply('🎉 Lifetime Pro unlocked! All premium features are now active. ⭐👑');
-        } else if (plan === 'premium_annual') {
-          await setPremium(userId, 12);
-          await ctx.reply('🎉 Annual Pro unlocked! You now have full premium access. ⭐');
+      if (product === 'plan_upgrade') {
+        if (plan === 'pro') {
+          await setUserPlan(userId, 'pro');
+          await ctx.reply('🎉 Pro unlocked! Advanced AI modes are now active. ⭐');
         } else {
-          await setPremium(userId, 1);
-          await ctx.reply('🎉 Pro unlocked! Advanced AI features are now active. ⭐');
+          await setUserPlan(userId, 'starter');
+          await ctx.reply('🎉 Starter unlocked! Unlimited task generation is now active. ⭐');
         }
       } else if (product === 'credits_pack') {
-        await updateCredits(userId, 20);
-        await ctx.reply('✅ Payment received. +20 AI credits have been added. ⚡');
+        await updateCredits(userId, 10);
+        await ctx.reply('✅ Payment received. +10 AI credits have been added. ⚡');
       }
     } catch (err) {
       console.error('Failed processing payment:', err);
