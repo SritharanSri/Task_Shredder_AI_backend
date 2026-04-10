@@ -24,22 +24,20 @@ if (!GROQ_API_KEY) {
 // ─────────────────────────────────────────────
 const app = express();
 
-// Restrict CORS to known origins.
-// Set ALLOWED_ORIGINS in Vercel env as a comma-separated list of extra origins.
-const ALLOWED_ORIGINS = [
-  WEBAPP_URL,
-  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
-  'http://localhost:5173',
-  'http://localhost:5174',
-  'http://localhost:5175',
-].filter(Boolean);
+// CORS: allow Telegram WebView (no origin), any *.vercel.app deploy, and localhost dev servers.
+// No env config needed.
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // Telegram WebView / curl / mobile
+  if (origin.endsWith('.vercel.app')) return true;
+  if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
+  if (/^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return true;
+  return false;
+}
 
 app.use(cors({
   origin: (origin, cb) => {
-    // No Origin header = Telegram WebView, curl, mobile — allow through
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o))) return cb(null, true);
-    console.warn(`[CORS] Blocked origin: ${origin}. Allowed: ${ALLOWED_ORIGINS.join(', ')}`);
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    console.warn(`[CORS] Blocked origin: ${origin}`);
     cb(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -495,6 +493,22 @@ async function launch() {
     });
   }
 }
+
+// ── Express error middleware ────────────────────────────
+// Must be registered AFTER all routes.
+// Ensures CORS headers are always present on error responses so the
+// browser never sees a naked CORS block caused by a server crash.
+app.use((err, req, res, _next) => {
+  const origin = req.headers.origin || '';
+  if (isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
+  const status = err.status || err.statusCode || 500;
+  console.error(`[Error] ${req.method} ${req.path} →`, err.message);
+  res.status(status).json({ error: err.message || 'Internal server error' });
+});
 
 launch().catch(err => {
   console.error('❌ Failed to launch bot:', err.message);
