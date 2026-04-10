@@ -255,7 +255,17 @@ app.post('/api/break-task', aiLimiter, async (req, res) => {
   }
 
   const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-  const SYSTEM_PROMPT = `You are a productivity assistant. When given a task, break it into exactly 5 clear, actionable Pomodoro-sized steps. Each step should take approximately 25 minutes. Be specific and practical. Start each step with a strong action verb. Return ONLY a valid JSON array of exactly 5 strings, no explanation, no markdown. Example: ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"]`;
+  const SYSTEM_PROMPT = `You are a world-class productivity coach and behavioral psychologist. Break the given task into exactly 5 micro-actionable steps ordered by priority (most critical first).
+
+For EACH step provide:
+- "title": Lead with 1 relevant emoji then a strong action verb. Be hyper-specific to this exact task — zero generic advice. Make it feel tailor-made.
+- "time": Realistic time estimate as a short string, e.g. "10 min", "25 min", "1 hr". Vary it — not every step is 25 min.
+- "difficulty": Exactly one of: "Easy 🟢", "Medium 🟡", or "Hard 🔴"
+- "motivation": One punchy, task-specific motivational tip. Max 12 words. Make it feel personal and energising.
+
+Return ONLY valid JSON in this exact shape — no explanation, no markdown:
+{ "steps": [ { "title": "...", "time": "...", "difficulty": "...", "motivation": "..." }, ... ] }
+Exactly 5 items.`;
 
   try {
     const controller = new AbortController();
@@ -272,7 +282,7 @@ app.post('/api/break-task', aiLimiter, async (req, res) => {
         model: 'llama-3.3-70b-versatile',
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `Break this task into 5 Pomodoro steps: ${task}` },
+          { role: 'user', content: `Break this task into 5 prioritised micro-steps: ${task}` },
         ],
         temperature: 0.7,
         max_tokens: 512,
@@ -305,9 +315,12 @@ app.post('/api/break-task', aiLimiter, async (req, res) => {
       throw new Error('Invalid response format from Groq');
     }
 
-    const formattedSteps = steps.slice(0, 5).map((title, i) => ({
+    const formattedSteps = steps.slice(0, 5).map((step, i) => ({
       id: Date.now() + i,
-      title: String(title).trim(),
+      title: String(typeof step === 'string' ? step : (step.title || step)).trim(),
+      time: step.time || '25 min',
+      difficulty: step.difficulty || 'Medium 🟡',
+      motivation: step.motivation || '',
       completed: false,
     }));
 
