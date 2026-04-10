@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
   plan                  TEXT        NOT NULL DEFAULT 'free',
   premium_expiry        TIMESTAMPTZ,
   daily_breakdowns      INTEGER     NOT NULL DEFAULT 0,
+  task_count_today      INTEGER     NOT NULL DEFAULT 0,
   daily_breakdown_date  TEXT,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -52,6 +53,7 @@ CREATE INDEX IF NOT EXISTS payments_created_at_idx ON payments(created_at DESC);
 -- Backfill columns for existing deployments
 ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS task_count_today INTEGER NOT NULL DEFAULT 0;
 
 -- ── Disable RLS (all access goes through the backend API) ───
 -- If you later want per-user RLS, enable it and add policies.
