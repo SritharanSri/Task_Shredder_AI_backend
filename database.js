@@ -45,12 +45,6 @@ function normalizePlan(user) {
   return 'starter';
 }
 
-// ── Coin system constants ─────────────────────────────────
-export const DAILY_COIN_LIMIT = 50;    // max coins earned from ads per day
-export const AD_COOLDOWN_SECONDS = 30; // min gap between SEPARATE ad rewards
-export const SAME_AD_WINDOW_SECONDS = 10; // within this window treat as same ad (idempotent)
-export const COINS_PER_AD = 10;        // coins awarded per completed ad
-
 // Default user shape returned when DB is unavailable
 function defaultUserResponse(id) {
   return {
@@ -72,9 +66,6 @@ function defaultUserResponse(id) {
     history: [],
     dailyBreakdownsLeft: FREE_DAILY_LIMIT,
     freeLimit: FREE_DAILY_LIMIT,
-    coins: 0,
-    dailyCoinsEarned: 0,
-    dailyCoinLimit: DAILY_COIN_LIMIT,
   };
 }
 
@@ -152,10 +143,6 @@ export async function getUser(id) {
       ? -1
       : Math.max(0, FREE_DAILY_LIMIT - (user.daily_breakdowns || 0));
 
-    const dailyCoinsEarned = user.daily_coins_date === getTodayStr()
-      ? (user.daily_coins_earned || 0)
-      : 0;
-
     return {
       id,
       telegramId: user.telegram_id || id,
@@ -177,9 +164,6 @@ export async function getUser(id) {
         : (history || []).map(h => ({ title: h.title, completedAt: h.completed_at })),
       dailyBreakdownsLeft,
       freeLimit: FREE_DAILY_LIMIT,
-      coins: user.coins || 0,
-      dailyCoinsEarned,
-      dailyCoinLimit: DAILY_COIN_LIMIT,
     };
   } catch (err) {
     console.error(`[DB] getUser(${id}) failed:`, err.message);
@@ -342,131 +326,4 @@ export async function restoreStreak(id) {  if (!supabase) throw new Error('Datab
   if (error) throw error;
 
   return getUser(id);
-}
-
-// ── Ad Reward system ──────────────────────────────────────
-
-/**
- * Award coins to a user after completing a rewarded ad.
- *
- * Idempotency windows:
- *   < SAME_AD_WINDOW_SECONDS  → same ad claimed twice (AdsGram server + client both fired)
- *                               → return success with current balance, no double-credit
- *   SAME_AD_WINDOW_SECONDS .. AD_COOLDOWN_SECONDS → genuine cooldown, reject with COOLDOWN
- *   > AD_COOLDOWN_SECONDS    → new ad, award coins
- *
- * Returns { coins, coinsEarned, totalCoinsToday, dailyLimit, cooldownSeconds, alreadyCredited? }
- */
-export async function rewardAd(userId, coins = COINS_PER_AD) {
-  if (!supabase) {
-    // Dev / offline mode — return mock success so frontend works without DB
-    return {
-      coins,
-      coinsEarned: coins,
-      totalCoinsToday: coins,
-      dailyLimit: DAILY_COIN_LIMIT,
-      cooldownSeconds: AD_COOLDOWN_SECONDS,
-    };
-  }
-
-  const user = await getOrCreateUser(userId);
-  const today = getTodayStr();
-  const now = new Date();
-
-  // ── Query most recent reward for this user ──
-  const { data: recent } = await supabase
-    .from('ad_rewards')
-    .select('rewarded_at, coins_earned')
-    .eq('user_id', userId)
-    .order('rewarded_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (recent) {
-    const secondsSince = (now - new Date(recent.rewarded_at)) / 1000;
-
-    if (secondsSince < SAME_AD_WINDOW_SECONDS) {
-      // Same ad: both AdsGram server callback AND client callback fired.
-      // Coins already credited once — return success idempotently without double-crediting.
-      const dailyCoins = user.daily_coins_date === today ? (user.daily_coins_earned || 0) : 0;
-      return {
-        coins: user.coins || 0,
-        coinsEarned: recent.coins_earned || coins, // show the amount that WAS earned
-        totalCoinsToday: dailyCoins,
-        dailyLimit: DAILY_COIN_LIMIT,
-        cooldownSeconds: Math.ceil(AD_COOLDOWN_SECONDS - secondsSince),
-        alreadyCredited: true,
-      };
-    }
-
-    if (secondsSince < AD_COOLDOWN_SECONDS) {
-      const waitSeconds = Math.ceil(AD_COOLDOWN_SECONDS - secondsSince);
-      const err = new Error(`Please wait ${waitSeconds}s before watching another ad`);
-      err.code = 'COOLDOWN';
-      err.waitSeconds = waitSeconds;
-      throw err;
-    }
-  }
-
-  // ── Daily limit check ──
-  const dailyCoins = user.daily_coins_date === today ? (user.daily_coins_earned || 0) : 0;
-  if (dailyCoins >= DAILY_COIN_LIMIT) {
-    const err = new Error('Daily coin limit reached. Come back tomorrow!');
-    err.code = 'DAILY_LIMIT';
-    throw err;
-  }
-
-  const newCoins = (user.coins || 0) + coins;
-  const newDailyCoins = dailyCoins + coins;
-
-  // ── Write coins update + audit record atomically (best-effort) ──
-  const [coinsUpdate, rewardInsert] = await Promise.all([
-    supabase.from('users').update({
-      coins: newCoins,
-      daily_coins_earned: newDailyCoins,
-      daily_coins_date: today,
-    }).eq('id', userId),
-    supabase.from('ad_rewards').insert({
-      user_id: userId,
-      ad_source: 'adsgram',
-      coins_earned: coins,
-    }),
-  ]);
-
-  if (coinsUpdate.error) throw coinsUpdate.error;
-  if (rewardInsert.error) throw rewardInsert.error;
-
-  return {
-    coins: newCoins,
-    coinsEarned: coins,
-    totalCoinsToday: newDailyCoins,
-    dailyLimit: DAILY_COIN_LIMIT,
-    cooldownSeconds: AD_COOLDOWN_SECONDS,
-  };
-}
-
-/**
- * Return top N users by coin balance for the leaderboard.
- */
-export async function getLeaderboard(limit = 10) {
-  if (!supabase) return [];
-
-  try {
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, telegram_id, coins')
-      .order('coins', { ascending: false })
-      .limit(limit);
-
-    if (error) throw error;
-    return (data || []).map((u, i) => ({
-      rank: i + 1,
-      userId: u.id,
-      telegramId: u.telegram_id || u.id,
-      coins: u.coins || 0,
-    }));
-  } catch (err) {
-    console.error('[DB] getLeaderboard failed:', err.message);
-    return [];
-  }
 }

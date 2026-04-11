@@ -5,7 +5,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
-import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setUserPlan, restoreStreak, recordPayment, FREE_DAILY_LIMIT, rewardAd, getLeaderboard } from './database.js';
+import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setUserPlan, restoreStreak, recordPayment, FREE_DAILY_LIMIT } from './database.js';
 
 // ─────────────────────────────────────────────
 // Config & Validation
@@ -571,126 +571,6 @@ app.post('/api/user/:userId/streak-restore', withTelegramAuth, async (req, res) 
     res.json(user);
   } catch (err) {
     res.status(err.message.includes('Pro') ? 403 : 500).json({ error: err.message });
-  }
-});
-
-// ── Ad Reward: rate limiter (10 requests / 5 min per IP) ──
-const rewardLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  max: 10,
-  keyGenerator: (req) => {
-    // Use forwarded IP (Vercel sets x-forwarded-for) or fallback
-    const forwarded = req.headers['x-forwarded-for'];
-    return (forwarded ? forwarded.split(',')[0] : req.ip || 'unknown').trim();
-  },
-  message: { error: 'Too many reward requests. Please try again later.' },
-});
-
-/**
- * POST /api/reward
- * Body: { userId: string }
- * Validates the userId, enforces cooldown + daily cap, awards 10 coins.
- * Security: IP rate limiting + per-user DB-level cooldown + daily limit.
- */
-app.post('/api/reward', rewardLimiter, async (req, res) => {
-  const rawUserId = req.body?.userId;
-  if (!rawUserId) return res.status(400).json({ error: 'userId is required' });
-
-  // Sanitize: allow Telegram user IDs (all digits) and generic alphanumeric IDs
-  const userId = String(rawUserId).trim().slice(0, 128);
-  if (!userId || !/^[\w.-]+$/.test(userId)) {
-    return res.status(400).json({ error: 'Invalid userId format' });
-  }
-
-  try {
-    const result = await rewardAd(userId);
-    res.json({
-      success: true,
-      coinsEarned: result.coinsEarned,
-      coins: result.coins,
-      totalCoinsToday: result.totalCoinsToday,
-      dailyLimit: result.dailyLimit,
-      cooldownSeconds: result.cooldownSeconds,
-      alreadyCredited: result.alreadyCredited || false,
-    });
-  } catch (err) {
-    if (err.code === 'COOLDOWN') {
-      return res.status(429).json({ error: err.message, code: 'COOLDOWN', waitSeconds: err.waitSeconds });
-    }
-    if (err.code === 'DAILY_LIMIT') {
-      return res.status(429).json({ error: err.message, code: 'DAILY_LIMIT' });
-    }
-    console.error('[/api/reward]', err.message);
-    res.status(500).json({ error: 'Failed to process reward' });
-  }
-});
-
-/**
- * GET /api/reward/callback
- *
- * AdsGram server-to-server postback endpoint.
- * AdsGram pings this URL after an ad is successfully viewed:
- *   GET /api/reward/callback?userId=[userId]
- *
- * IMPORTANT: This endpoint MUST always return HTTP 200 with JSON.
- * If it returns anything else, AdsGram shows "Reward process failed" in the
- * Telegram native alert and blocks the client-side onReward callback.
- *
- * Configure in AdsGram dashboard → your block → Reward URL:
- *   https://<YOUR_BACKEND_DOMAIN>/api/reward/callback?userId=[userId]
- *   (AdsGram replaces [userId] with the actual user ID automatically)
- */
-app.get('/api/reward/callback', rewardLimiter, async (req, res) => {
-  const rawUserId = req.query?.userId;
-
-  // Always respond 200 first so AdsGram doesn't time out and show the alert.
-  // Coin crediting is done below; errors are logged but silently swallowed.
-  if (!rawUserId) {
-    console.warn('[/api/reward/callback] Missing userId param');
-    return res.status(200).json({ ok: false, error: 'userId missing' });
-  }
-
-  const userId = String(rawUserId).trim().slice(0, 128);
-  if (!userId || !/^[\w.-]+$/.test(userId)) {
-    console.warn('[/api/reward/callback] Invalid userId:', rawUserId);
-    return res.status(200).json({ ok: false, error: 'invalid userId' });
-  }
-
-  try {
-    const result = await rewardAd(userId);
-    console.log(`[/api/reward/callback] Rewarded user ${userId}: +${result.coinsEarned} coins (alreadyCredited=${result.alreadyCredited || false})`);
-    return res.status(200).json({
-      ok: true,
-      coins: result.coins,
-      coinsEarned: result.coinsEarned,
-      alreadyCredited: result.alreadyCredited || false,
-    });
-  } catch (err) {
-    if (err.code === 'COOLDOWN') {
-      // Still return 200 — AdsGram must not show the error alert for a cooldown
-      console.log(`[/api/reward/callback] Cooldown for user ${userId}: ${err.message}`);
-      return res.status(200).json({ ok: true, cooldown: true, waitSeconds: err.waitSeconds });
-    }
-    if (err.code === 'DAILY_LIMIT') {
-      console.log(`[/api/reward/callback] Daily limit for user ${userId}`);
-      return res.status(200).json({ ok: true, dailyLimit: true });
-    }
-    console.error('[/api/reward/callback] Unexpected error:', err.message);
-    // Still 200 — never let AdsGram show the "Reward process failed" alert
-    return res.status(200).json({ ok: true, error: 'internal' });
-  }
-});
-
-/**
- * GET /api/leaderboard
- * Returns top 10 users by coin balance.
- */
-app.get('/api/leaderboard', async (_req, res) => {
-  try {
-    const board = await getLeaderboard(10);
-    res.json(board);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
 });
 
