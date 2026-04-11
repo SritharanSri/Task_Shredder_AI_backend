@@ -46,8 +46,9 @@ function normalizePlan(user) {
 }
 
 // ── Coin system constants ─────────────────────────────────
-export const DAILY_COIN_LIMIT = 50;   // max coins earned from ads per day
-export const AD_COOLDOWN_SECONDS = 30; // min gap between ad rewards
+export const DAILY_COIN_LIMIT = 50;    // max coins earned from ads per day
+export const AD_COOLDOWN_SECONDS = 30; // min gap between SEPARATE ad rewards
+export const SAME_AD_WINDOW_SECONDS = 10; // within this window treat as same ad (idempotent)
 export const COINS_PER_AD = 10;        // coins awarded per completed ad
 
 // Default user shape returned when DB is unavailable
@@ -347,8 +348,14 @@ export async function restoreStreak(id) {  if (!supabase) throw new Error('Datab
 
 /**
  * Award coins to a user after completing a rewarded ad.
- * Enforces per-user cooldown (AD_COOLDOWN_SECONDS) and daily cap (DAILY_COIN_LIMIT).
- * Returns { coins, coinsEarned, totalCoinsToday, dailyLimit, cooldownSeconds }.
+ *
+ * Idempotency windows:
+ *   < SAME_AD_WINDOW_SECONDS  → same ad claimed twice (AdsGram server + client both fired)
+ *                               → return success with current balance, no double-credit
+ *   SAME_AD_WINDOW_SECONDS .. AD_COOLDOWN_SECONDS → genuine cooldown, reject with COOLDOWN
+ *   > AD_COOLDOWN_SECONDS    → new ad, award coins
+ *
+ * Returns { coins, coinsEarned, totalCoinsToday, dailyLimit, cooldownSeconds, alreadyCredited? }
  */
 export async function rewardAd(userId, coins = COINS_PER_AD) {
   if (!supabase) {
@@ -366,10 +373,10 @@ export async function rewardAd(userId, coins = COINS_PER_AD) {
   const today = getTodayStr();
   const now = new Date();
 
-  // ── Cooldown check: query most recent reward for this user ──
+  // ── Query most recent reward for this user ──
   const { data: recent } = await supabase
     .from('ad_rewards')
-    .select('rewarded_at')
+    .select('rewarded_at, coins_earned')
     .eq('user_id', userId)
     .order('rewarded_at', { ascending: false })
     .limit(1)
@@ -377,6 +384,21 @@ export async function rewardAd(userId, coins = COINS_PER_AD) {
 
   if (recent) {
     const secondsSince = (now - new Date(recent.rewarded_at)) / 1000;
+
+    if (secondsSince < SAME_AD_WINDOW_SECONDS) {
+      // Same ad: both AdsGram server callback AND client callback fired.
+      // Coins already credited once — return success idempotently without double-crediting.
+      const dailyCoins = user.daily_coins_date === today ? (user.daily_coins_earned || 0) : 0;
+      return {
+        coins: user.coins || 0,
+        coinsEarned: recent.coins_earned || coins, // show the amount that WAS earned
+        totalCoinsToday: dailyCoins,
+        dailyLimit: DAILY_COIN_LIMIT,
+        cooldownSeconds: Math.ceil(AD_COOLDOWN_SECONDS - secondsSince),
+        alreadyCredited: true,
+      };
+    }
+
     if (secondsSince < AD_COOLDOWN_SECONDS) {
       const waitSeconds = Math.ceil(AD_COOLDOWN_SECONDS - secondsSince);
       const err = new Error(`Please wait ${waitSeconds}s before watching another ad`);

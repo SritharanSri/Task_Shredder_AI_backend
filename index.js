@@ -611,6 +611,7 @@ app.post('/api/reward', rewardLimiter, async (req, res) => {
       totalCoinsToday: result.totalCoinsToday,
       dailyLimit: result.dailyLimit,
       cooldownSeconds: result.cooldownSeconds,
+      alreadyCredited: result.alreadyCredited || false,
     });
   } catch (err) {
     if (err.code === 'COOLDOWN') {
@@ -621,6 +622,62 @@ app.post('/api/reward', rewardLimiter, async (req, res) => {
     }
     console.error('[/api/reward]', err.message);
     res.status(500).json({ error: 'Failed to process reward' });
+  }
+});
+
+/**
+ * GET /api/reward/callback
+ *
+ * AdsGram server-to-server postback endpoint.
+ * AdsGram pings this URL after an ad is successfully viewed:
+ *   GET /api/reward/callback?userId=[userId]
+ *
+ * IMPORTANT: This endpoint MUST always return HTTP 200 with JSON.
+ * If it returns anything else, AdsGram shows "Reward process failed" in the
+ * Telegram native alert and blocks the client-side onReward callback.
+ *
+ * Configure in AdsGram dashboard → your block → Reward URL:
+ *   https://<YOUR_BACKEND_DOMAIN>/api/reward/callback?userId=[userId]
+ *   (AdsGram replaces [userId] with the actual user ID automatically)
+ */
+app.get('/api/reward/callback', rewardLimiter, async (req, res) => {
+  const rawUserId = req.query?.userId;
+
+  // Always respond 200 first so AdsGram doesn't time out and show the alert.
+  // Coin crediting is done below; errors are logged but silently swallowed.
+  if (!rawUserId) {
+    console.warn('[/api/reward/callback] Missing userId param');
+    return res.status(200).json({ ok: false, error: 'userId missing' });
+  }
+
+  const userId = String(rawUserId).trim().slice(0, 128);
+  if (!userId || !/^[\w.-]+$/.test(userId)) {
+    console.warn('[/api/reward/callback] Invalid userId:', rawUserId);
+    return res.status(200).json({ ok: false, error: 'invalid userId' });
+  }
+
+  try {
+    const result = await rewardAd(userId);
+    console.log(`[/api/reward/callback] Rewarded user ${userId}: +${result.coinsEarned} coins (alreadyCredited=${result.alreadyCredited || false})`);
+    return res.status(200).json({
+      ok: true,
+      coins: result.coins,
+      coinsEarned: result.coinsEarned,
+      alreadyCredited: result.alreadyCredited || false,
+    });
+  } catch (err) {
+    if (err.code === 'COOLDOWN') {
+      // Still return 200 — AdsGram must not show the error alert for a cooldown
+      console.log(`[/api/reward/callback] Cooldown for user ${userId}: ${err.message}`);
+      return res.status(200).json({ ok: true, cooldown: true, waitSeconds: err.waitSeconds });
+    }
+    if (err.code === 'DAILY_LIMIT') {
+      console.log(`[/api/reward/callback] Daily limit for user ${userId}`);
+      return res.status(200).json({ ok: true, dailyLimit: true });
+    }
+    console.error('[/api/reward/callback] Unexpected error:', err.message);
+    // Still 200 — never let AdsGram show the "Reward process failed" alert
+    return res.status(200).json({ ok: true, error: 'internal' });
   }
 });
 
