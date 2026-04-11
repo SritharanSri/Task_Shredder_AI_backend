@@ -55,8 +55,29 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS task_count_today INTEGER NOT NULL DEFAULT 0;
 
+-- ── Coins reward system ─────────────────────────────────────
+-- coins: ad-earned currency balance
+-- daily_coins_earned: total coins earned from ads today (for daily cap)
+-- daily_coins_date: ISO date string of the current daily window
+ALTER TABLE users ADD COLUMN IF NOT EXISTS coins               INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_coins_earned  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_coins_date    TEXT;
+
+-- ── Ad rewards ledger ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ad_rewards (
+  id           BIGSERIAL   PRIMARY KEY,
+  user_id      TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rewarded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ad_source    TEXT        NOT NULL DEFAULT 'adsgram',
+  coins_earned INTEGER     NOT NULL DEFAULT 10
+);
+
+CREATE INDEX IF NOT EXISTS ad_rewards_user_id_idx     ON ad_rewards(user_id);
+CREATE INDEX IF NOT EXISTS ad_rewards_rewarded_at_idx ON ad_rewards(rewarded_at DESC);
+
 -- ── Disable RLS (all access goes through the backend API) ───
 -- If you later want per-user RLS, enable it and add policies.
-ALTER TABLE users   DISABLE ROW LEVEL SECURITY;
-ALTER TABLE sessions DISABLE ROW LEVEL SECURITY;
-ALTER TABLE payments DISABLE ROW LEVEL SECURITY;
+ALTER TABLE users      DISABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE payments   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE ad_rewards DISABLE ROW LEVEL SECURITY;

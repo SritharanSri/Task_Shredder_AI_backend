@@ -5,7 +5,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { rateLimit } from 'express-rate-limit';
 import { Telegraf, Markup } from 'telegraf';
-import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setUserPlan, restoreStreak, recordPayment, FREE_DAILY_LIMIT } from './database.js';
+import { getUser, addSession, updateCredits, clearHistory, checkAndIncrementBreakdown, setUserPlan, restoreStreak, recordPayment, FREE_DAILY_LIMIT, rewardAd, getLeaderboard } from './database.js';
 
 // ─────────────────────────────────────────────
 // Config & Validation
@@ -571,6 +571,69 @@ app.post('/api/user/:userId/streak-restore', withTelegramAuth, async (req, res) 
     res.json(user);
   } catch (err) {
     res.status(err.message.includes('Pro') ? 403 : 500).json({ error: err.message });
+  }
+});
+
+// ── Ad Reward: rate limiter (10 requests / 5 min per IP) ──
+const rewardLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => {
+    // Use forwarded IP (Vercel sets x-forwarded-for) or fallback
+    const forwarded = req.headers['x-forwarded-for'];
+    return (forwarded ? forwarded.split(',')[0] : req.ip || 'unknown').trim();
+  },
+  message: { error: 'Too many reward requests. Please try again later.' },
+});
+
+/**
+ * POST /api/reward
+ * Body: { userId: string }
+ * Validates the userId, enforces cooldown + daily cap, awards 10 coins.
+ * Security: IP rate limiting + per-user DB-level cooldown + daily limit.
+ */
+app.post('/api/reward', rewardLimiter, async (req, res) => {
+  const rawUserId = req.body?.userId;
+  if (!rawUserId) return res.status(400).json({ error: 'userId is required' });
+
+  // Sanitize: allow Telegram user IDs (all digits) and generic alphanumeric IDs
+  const userId = String(rawUserId).trim().slice(0, 128);
+  if (!userId || !/^[\w.-]+$/.test(userId)) {
+    return res.status(400).json({ error: 'Invalid userId format' });
+  }
+
+  try {
+    const result = await rewardAd(userId);
+    res.json({
+      success: true,
+      coinsEarned: result.coinsEarned,
+      coins: result.coins,
+      totalCoinsToday: result.totalCoinsToday,
+      dailyLimit: result.dailyLimit,
+      cooldownSeconds: result.cooldownSeconds,
+    });
+  } catch (err) {
+    if (err.code === 'COOLDOWN') {
+      return res.status(429).json({ error: err.message, code: 'COOLDOWN', waitSeconds: err.waitSeconds });
+    }
+    if (err.code === 'DAILY_LIMIT') {
+      return res.status(429).json({ error: err.message, code: 'DAILY_LIMIT' });
+    }
+    console.error('[/api/reward]', err.message);
+    res.status(500).json({ error: 'Failed to process reward' });
+  }
+});
+
+/**
+ * GET /api/leaderboard
+ * Returns top 10 users by coin balance.
+ */
+app.get('/api/leaderboard', async (_req, res) => {
+  try {
+    const board = await getLeaderboard(10);
+    res.json(board);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
